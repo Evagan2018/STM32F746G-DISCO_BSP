@@ -1,180 +1,303 @@
-name: Test MDK-Middleware RefApps (Default)   # MDK-Middleware Reference Applications (Examples)
-
-on:
-  workflow_dispatch:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
-  schedule:
-    - cron: '00 20 * * 6'
-
+name: Test MDK-Middleware RefApps (Default)
+'on':
+  workflow_dispatch: null
 jobs:
-  Test:                     # Install tools, build
+  Test:
     runs-on: ubuntu-latest
     env:
       TARGET_BOARD: STM32F746G-DISCO
-
     strategy:
       fail-fast: false
       matrix:
-        solution: [
-          {name: FileSystem, dir: FileSystem, layer_ac6: ./BSP/Layers/Default, layer_gcc: ./.ci/Layers/Default_GCC},
-          {name: Network,    dir: Network,    layer_ac6: ./BSP/Layers/Default, layer_gcc: ./.ci/Layers/Default_GCC},
-          {name: USB_Device, dir: USB/Device, layer_ac6: ./BSP/Layers/Default, layer_gcc: ./.ci/Layers/Default_GCC},
-          {name: USB_Host,   dir: USB/Host,   layer_ac6: ./BSP/Layers/Default, layer_gcc: ./.ci/Layers/Default_GCC}
-        ]
-
+        solution:
+        - name: FileSystem
+          dir: FileSystem
+          layer_ac6: ./BSP/Layers/Default
+          layer_gcc: ./.ci/Layers/Default_GCC
+        - name: Network
+          dir: Network
+          layer_ac6: ./BSP/Layers/Default
+          layer_gcc: ./.ci/Layers/Default_GCC
+        - name: USB_Device
+          dir: USB/Device
+          layer_ac6: ./BSP/Layers/Default
+          layer_gcc: ./.ci/Layers/Default_GCC
+        - name: USB_Host
+          dir: USB/Host
+          layer_ac6: ./BSP/Layers/Default
+          layer_gcc: ./.ci/Layers/Default_GCC
     steps:
-      - name: Checkout .ci folder
-        uses: actions/checkout@v7
-        with:
-          sparse-checkout: |
-            .ci
+    - name: Checkout .ci folder
+      uses: actions/checkout@v7
+      with:
+        sparse-checkout: |
+          .ci
+        repository: Evagan2018/STM32F746G-DISCO_BSP
+        ref: cmsis-pack-6.4.0-test-20261013-083944
+    - name: Install tools
+      uses: ARM-software/cmsis-actions/vcpkg@v1
+      with:
+        config: ./.ci/vcpkg-configuration.json
+    - name: Activate Arm tool license
+      uses: ARM-software/cmsis-actions/armlm@v1
+    - name: Checkout current repository
+      uses: actions/checkout@v7
+      with:
+        path: ./BSP
+        repository: Evagan2018/STM32F746G-DISCO_BSP
+        ref: cmsis-pack-6.4.0-test-20261013-083944
+    - name: Checkout STM32F7xx_DFP
+      uses: actions/checkout@v7
+      with:
+        repository: Open-CMSIS-Pack/STM32F7xx_DFP
+        path: ./DFP
+    - name: Checkout MDK-Middleware
+      uses: actions/checkout@v7
+      with:
+        repository: ARM-software/MDK-Middleware
+        path: ./MDK-Middleware
+        ref: 0a0a1cc468cfded525c2824fc9cec6cba4b374f5
+    - name: Checkout CMSIS-Driver_STM32
+      uses: actions/checkout@v7
+      with:
+        repository: Open-CMSIS-Pack/CMSIS-Driver_STM32
+        path: ./Drivers
+    - name: Initialize CMSIS pack root folder
+      run: |
+        cpackget init https://www.keil.com/pack/index.pidx
+        cpackget update-index
+    - name: Add local CMSIS packs
+      run: |
+        cpackget add ./BSP/Keil.STM32F746G-DISCO_BSP.pdsc
+        cpackget add ./DFP/Keil.STM32F7xx_DFP.pdsc
+        cpackget add ./MDK-Middleware/Keil.MDK-Middleware.pdsc
+        cpackget add ./Drivers/ARM.CMSIS-Driver_STM32.pdsc
+    - name: Copy example structure to CI/MW-RefApps/ folder
+      working-directory: ./
+      run: |
+        mkdir -p ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/
+        cp -a ./MDK-Middleware/Examples/. ./CI/MW-RefApps/Examples/
+    - name: Install CMSIS 6.4.0 qualification probe
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/cmsis-pack-test"
+        cat > "$RUNNER_TEMP/cmsis-pack-test/probe.py" <<'CMSIS_PROBE_EOF'
+        #!/usr/bin/env python3
+        """Ephemeral runner instrumentation for the CMSIS 6.4.0 campaign (stdlib only)."""
+        import json, os, re, shutil, subprocess, sys, time
+        from pathlib import Path
 
-      - name: Install tools
-        uses: ARM-software/cmsis-actions/vcpkg@v1
-        with:
-          config: "./.ci/vcpkg-configuration.json"
+        TARGET = 'ARM::CMSIS@6.4.0'
+        HOME = Path(os.environ.get('RUNNER_TEMP', '.')) / 'cmsis-pack-test'
+        WORKSPACE = Path(os.environ.get('GITHUB_WORKSPACE', '.')).resolve()
+        SKIP = {'.git', '.packs', '.Download', 'node_modules', 'boost_1_84_0'}
 
-      - name: Activate Arm tool license
-        uses: ARM-software/cmsis-actions/armlm@v1
+        def files(root=WORKSPACE):
+            for base, dirs, names in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in SKIP and not Path(base, d).is_symlink()]
+                for name in names:
+                    if name.endswith(('.yml', '.yaml')):
+                        yield Path(base, name)
 
-      - name: Checkout current repository
-        uses: actions/checkout@v7
-        with:
-          path: ./BSP
+        def pin(text, lock=False):
+            lines = text.splitlines(keepends=True)
+            result = []
+            i = 0
+            key = 'resolved-pack' if lock else 'pack'
+            pattern = re.compile(r'^(\s*)-\s+' + key + r':\s*[\"\x27]?ARM::CMSIS(?=[@\s\"\x27]|$)', re.I)
+            while i < len(lines):
+                match = pattern.match(lines[i])
+                if not match:
+                    result.append(lines[i]); i += 1; continue
+                indent = len(match[1])
+                j = i + 1
+                while j < len(lines):
+                    line = lines[j]
+                    if line.strip() and not line.lstrip().startswith('#') and len(line) - len(line.lstrip()) <= indent:
+                        break
+                    j += 1
+                if not lock:
+                    result.append(match[1] + '- pack: ' + TARGET + '\n')
+                    result.extend(x for x in lines[i+1:j] if not re.match(r'^\s+path:', x))
+                i = j
+            return ''.join(result)
 
-      - name: Checkout STM32F7xx_DFP
-        uses: actions/checkout@v7
-        with:
-          repository: Open-CMSIS-Pack/STM32F7xx_DFP
-          path: ./DFP
+        def prepare():
+            changed = []
+            for path in files():
+                if not path.name.endswith(('.csolution.yml', '.cproject.yml', '.clayer.yml', '.cbuild-pack.yml')):
+                    continue
+                old = path.read_text(encoding='utf-8-sig')
+                new = pin(old, path.name.endswith('.cbuild-pack.yml'))
+                if old != new:
+                    path.write_text(new, encoding='utf-8')
+                    changed.append(str(path.relative_to(WORKSPACE)))
+            return changed
 
-      - name: Checkout MDK-Middleware
-        uses: actions/checkout@v7
-        with:
-          repository: ARM-software/MDK-Middleware
-          path: ./MDK-Middleware
+        def emit(record):
+            HOME.mkdir(parents=True, exist_ok=True)
+            with (HOME/'evidence.jsonl').open('a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + '\n')
+            print('CMSIS_PACK_TEST_RESULT ' + json.dumps(record), flush=True)
 
-      - name: Checkout CMSIS-Driver_STM32
-        uses: actions/checkout@v7
-        with:
-          repository: Open-CMSIS-Pack/CMSIS-Driver_STM32
-          path: ./Drivers
+        def wrapper():
+            args = sys.argv[1:]
+            real = (HOME/'real-cbuild.txt').read_text().strip()
+            if not any('.csolution.' in a for a in args) or any(a in args for a in ['--help', '--version', 'list', 'clean']):
+                return subprocess.call([real] + args)
+            changed = prepare()
+            before = {str(p): p.stat().st_mtime_ns for p in files() if p.name.endswith('.cbuild.yml')}
+            started = time.time()
+            rc = subprocess.call([real] + args)
+            evidence = []
+            for p in files():
+                if not p.name.endswith('.cbuild.yml') or before.get(str(p)) == p.stat().st_mtime_ns:
+                    continue
+                text = p.read_text(encoding='utf-8-sig')
+                packs = sorted(set(re.findall(r'(?:pack|from-pack):\s*[\"\x27]?(ARM::CMSIS@[^\s\"\x27]+)', text)))
+                if packs:
+                    ctx = re.search(r'^\s*context:\s*(.+)$', text, re.M)
+                    evidence.append({'file':str(p.relative_to(WORKSPACE)), 'context':ctx[1].strip() if ctx else p.name,
+                                     'packs':packs, 'verified':packs == [TARGET]})
+            build_action = not any(a in args for a in ['setup', 'convert'])
+            good = bool(evidence) and all(e['verified'] for e in evidence)
+            record = {'kind':'build' if build_action else 'setup','cwd':str(Path.cwd()),'args':args,
+                      'returncode':rc,'version_verified':good,'contexts':evidence,'patched_inputs':changed,
+                      'seconds':round(time.time()-started,2)}
+            emit(record)
+            # Preserve the builder return code. The always-run final check separately rejects
+            # missing/wrong evidence and failures swallowed by upstream scripts.
+            return rc
 
-      - name: Initialize CMSIS pack root folder
-        run: |
-          cpackget init https://www.keil.com/pack/index.pidx
-          cpackget update-index
+        def install():
+            HOME.mkdir(parents=True, exist_ok=True)
+            prepare()
+            bindir = HOME/'bin'; bindir.mkdir(exist_ok=True)
+            if not (HOME/'real-cbuild.txt').exists():
+                real = shutil.which('cbuild')
+                if not real:
+                    raise RuntimeError('cbuild unavailable at qualification setup')
+                (HOME/'real-cbuild.txt').write_text(real)
+                wrapper_path = bindir/'cbuild'
+                wrapper_path.write_text('#!/bin/sh\nexec python3 "' + str(HOME/'probe.py') + '" "$@"\n')
+                wrapper_path.chmod(0o755)
+                with open(os.environ['GITHUB_PATH'], 'a') as f:
+                    f.write(str(bindir)+'\n')
+            print('CMSIS_PACK_TEST_SETUP target=' + TARGET, flush=True)
 
-      - name: Add local CMSIS packs
-        run: |
-          cpackget add ./BSP/Keil.STM32F746G-DISCO_BSP.pdsc
-          cpackget add ./DFP/Keil.STM32F7xx_DFP.pdsc
-          cpackget add ./MDK-Middleware/Keil.MDK-Middleware.pdsc
-          cpackget add ./Drivers/ARM.CMSIS-Driver_STM32.pdsc
+        def finish():
+            path = HOME/'evidence.jsonl'
+            if not path.exists():
+                print('::error::No instrumented cbuild invocation reached; CMSIS 6.4.0 not verified')
+                return 1
+            records = [json.loads(line) for line in path.read_text().splitlines() if line]
+            for r in records:
+                print('CMSIS_PACK_TEST_FINAL ' + json.dumps(r), flush=True)
+            builds = [r for r in records if r['kind']=='build']
+            good = bool(builds) and all(r['returncode']==0 and r['version_verified'] for r in builds)
+            print('CMSIS_PACK_TEST_GATE ' + json.dumps({'passed':good,'build_invocations':len(builds)}))
+            return 0 if good else 1
 
-      - name: Copy example structure to CI/MW-RefApps/ folder
-        working-directory: ./
-        run: |
-          mkdir -p ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/
-          cp -a ./MDK-Middleware/Examples/. ./CI/MW-RefApps/Examples/
+        if __name__ == '__main__':
+            if sys.argv[1:] == ['--probe-install']:
+                install()
+            elif sys.argv[1:] == ['--probe-finish']:
+                sys.exit(finish())
+            else:
+                sys.exit(wrapper())
 
-      - name: Replace specific csolution files
-        working-directory: ./
-        run: |
-          if [ -e ./.ci/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml ]
-          then
-             cp -f ./.ci/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
-          fi
-
-      - name: Add the board layer to the ${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
-        working-directory: ./
-        run: |
-          sed -i "s|target-types:|&\n    - type: $TARGET_BOARD\n      board: $TARGET_BOARD\n      variables:\n        - Board-Layer: \$SolutionDir()\$/Board/Board.clayer.yml|"  ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
-
-      - name: Update board layer for ${{ matrix.solution.name }} AC6 build test
-        if: always()
-        working-directory: ./
-        run: |
-          cp -rf ${{ matrix.solution.layer_ac6 }}/* ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/   # Copy the Board layer
-
-      - name: ${{ matrix.solution.name }} AC6 build test (Release)
-        if: always()
-        working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-        run: |
-          cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Release+* \
-          --update-rte --packs --toolchain AC6 --rebuild
-
-      - name: Upload Artifact of the ${{ matrix.solution.name }} AC6 build (Release)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.solution.name }}_AC6_Release
-          path: |
-            ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-            !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
-          retention-days: 1
-
-      - name: ${{ matrix.solution.name }} AC6 build test (Debug)
-        if: always()
-        working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-        run: |
-          cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Debug+* \
-          --update-rte --packs --toolchain AC6 --rebuild
-
-      - name: Upload Artifact of the ${{ matrix.solution.name }} AC6 build (Debug)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.solution.name }}_AC6_Debug
-          path: |
-            ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-            !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
-          retention-days: 1
-
-      - name: Update board layer for ${{ matrix.solution.name }} GCC build test
-        if: always()
-        working-directory: ./
-        run: |
-          rm -rf ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/*
-          cp -rf ${{ matrix.solution.layer_gcc }}/* ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/   # Copy the Board layer
-
-      - name: ${{ matrix.solution.name }} GCC build test (Release)
-        if: always()
-        working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-        run: |
-          rm -rf out
-          rm -rf tmp
-          cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Release+* \
-          --update-rte --packs --toolchain GCC --rebuild
-
-      - name: Upload Artifact of the ${{ matrix.solution.name }} GCC build (Release)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.solution.name }}_GCC_Release
-          path: |
-            ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-            !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
-          retention-days: 1
-
-      - name: ${{ matrix.solution.name }} GCC build test (Debug)
-        if: always()
-        working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-        run: |
-          rm -rf out
-          rm -rf tmp
-          cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Debug+* \
-          --update-rte --packs --toolchain GCC --rebuild
-
-      - name: Upload Artifact of the ${{ matrix.solution.name }} GCC build (Debug)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.solution.name }}_GCC_Debug
-          path: |
-            ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
-            !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
-          retention-days: 1
+        CMSIS_PROBE_EOF
+        python3 "$RUNNER_TEMP/cmsis-pack-test/probe.py" --probe-install
+    - name: Replace specific csolution files
+      working-directory: ./
+      run: |
+        if [ -e ./.ci/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml ]
+        then
+           cp -f ./.ci/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
+        fi
+    - name: Add the board layer to the ${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
+      working-directory: ./
+      run: |
+        sed -i "s|target-types:|&\n    - type: $TARGET_BOARD\n      board: $TARGET_BOARD\n      variables:\n        - Board-Layer: \$SolutionDir()\$/Board/Board.clayer.yml|"  ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/${{ matrix.solution.name }}.csolution.yml
+    - name: Update board layer for ${{ matrix.solution.name }} AC6 build test
+      if: always()
+      working-directory: ./
+      run: |
+        cp -rf ${{ matrix.solution.layer_ac6 }}/* ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/   # Copy the Board layer
+    - name: ${{ matrix.solution.name }} AC6 build test (Release)
+      if: always()
+      working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+      run: |
+        cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Release+* \
+        --update-rte --packs --toolchain AC6 --rebuild
+    - name: Upload Artifact of the ${{ matrix.solution.name }} AC6 build (Release)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.solution.name }}_AC6_Release
+        path: |
+          ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+          !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
+        retention-days: 1
+    - name: ${{ matrix.solution.name }} AC6 build test (Debug)
+      if: always()
+      working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+      run: |
+        cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Debug+* \
+        --update-rte --packs --toolchain AC6 --rebuild
+    - name: Upload Artifact of the ${{ matrix.solution.name }} AC6 build (Debug)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.solution.name }}_AC6_Debug
+        path: |
+          ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+          !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
+        retention-days: 1
+    - name: Update board layer for ${{ matrix.solution.name }} GCC build test
+      if: always()
+      working-directory: ./
+      run: |
+        rm -rf ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/*
+        cp -rf ${{ matrix.solution.layer_gcc }}/* ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/Board/   # Copy the Board layer
+    - name: ${{ matrix.solution.name }} GCC build test (Release)
+      if: always()
+      working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+      run: |
+        rm -rf out
+        rm -rf tmp
+        cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Release+* \
+        --update-rte --packs --toolchain GCC --rebuild
+    - name: Upload Artifact of the ${{ matrix.solution.name }} GCC build (Release)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.solution.name }}_GCC_Release
+        path: |
+          ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+          !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
+        retention-days: 1
+    - name: ${{ matrix.solution.name }} GCC build test (Debug)
+      if: always()
+      working-directory: ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+      run: |
+        rm -rf out
+        rm -rf tmp
+        cbuild ./${{ matrix.solution.name }}.csolution.yml --context .Debug+* \
+        --update-rte --packs --toolchain GCC --rebuild
+    - name: Upload Artifact of the ${{ matrix.solution.name }} GCC build (Debug)
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ matrix.solution.name }}_GCC_Debug
+        path: |
+          ./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/
+          !./CI/MW-RefApps/Examples/${{ matrix.solution.dir }}/tmp/
+        retention-days: 1
+    - name: Verify CMSIS 6.4.0 build evidence
+      if: always()
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: python3 "$RUNNER_TEMP/cmsis-pack-test/probe.py" --probe-finish
+run-name: CMSIS 6.4.0 qualification - Test-MDK-Middleware-RefApps.yml
